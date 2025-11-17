@@ -479,7 +479,8 @@ def save_bot_state():
         'escrow_deals': escrow_deals,
         'bot_stopped': bot_stopped,
         'CURRENT_ADDRESS_INDEX': CURRENT_ADDRESS_INDEX,
-        'bot_settings': bot_settings # NEW
+        'bot_settings': bot_settings, # NEW
+        'crypto_user_deposits': crypto_user_deposits  # NEW: Save crypto deposit tracking
     }
     try:
         with open(STATE_FILE, "w") as f:
@@ -495,7 +496,7 @@ def save_bot_state():
 
 def load_bot_state():
     """Loads the bot state from a single JSON file."""
-    global user_wallets, username_to_userid, user_stats, game_sessions, user_pending_invitations, user_deposit_sessions, escrow_deals, bot_stopped, CURRENT_ADDRESS_INDEX, bot_settings, group_settings, recovery_data, gift_codes
+    global user_wallets, username_to_userid, user_stats, game_sessions, user_pending_invitations, user_deposit_sessions, escrow_deals, bot_stopped, CURRENT_ADDRESS_INDEX, bot_settings, group_settings, recovery_data, gift_codes, crypto_user_deposits
 
     # Load individual files first as a fallback
     load_all_user_data()
@@ -503,6 +504,7 @@ def load_bot_state():
     load_all_group_settings() # NEW
     load_all_recovery_data() # NEW
     load_all_gift_codes() # NEW
+    load_crypto_prices() # NEW: Load cached prices
 
     if os.path.exists(STATE_FILE):
         try:
@@ -518,6 +520,11 @@ def load_bot_state():
             bot_stopped = state.get('bot_stopped', False)
             CURRENT_ADDRESS_INDEX = state.get('CURRENT_ADDRESS_INDEX', 0)
             bot_settings.update(state.get('bot_settings', {})) # NEW
+            
+            # Load crypto deposit tracking with user_id as int
+            raw_deposits = state.get('crypto_user_deposits', {})
+            crypto_user_deposits.update({int(k): v for k, v in raw_deposits.items()})
+            
             logging.info("Bot state restored successfully from state file.")
         except (json.JSONDecodeError, Exception) as e:
             logging.error(f"Could not load bot state from {STATE_FILE}: {e}. Relying on individual files.")
@@ -5926,6 +5933,19 @@ async def monitor_deposit(context: ContextTypes.DEFAULT_TYPE):
                     if usd_value >= MIN_DEPOSIT_USD:
                         await ensure_user_in_wallets(user_id, context=context)
                         user_wallets[user_id] += usd_value
+                        
+                        # Track original crypto amount for price adjustments
+                        crypto_amount = int(tx.get("value", 0)) / (10 ** decimals)
+                        if user_id not in crypto_user_deposits:
+                            crypto_user_deposits[user_id] = []
+                        crypto_user_deposits[user_id].append({
+                            "method": method,
+                            "crypto_amount": crypto_amount,
+                            "usd_value_at_deposit": usd_value,
+                            "tx_hash": tx_hash,
+                            "timestamp": str(datetime.now(timezone.utc))
+                        })
+                        
                         update_stats_on_deposit(user_id, usd_value, tx_hash, method)
                         update_pnl(user_id)
                         save_user_data(user_id)
@@ -6000,6 +6020,186 @@ async def check_addresses_for_gas(context: ContextTypes.DEFAULT_TYPE):
                     try: await context.bot.send_message(chat_id=BOT_OWNER_ID, text=f"⚠️ Gas Alert: {address} has {token_amount} {method} but needs {needed_bnb} BNB for gas.")
                     except Exception as e: logging.error(f"Failed to send gas alert to admin: {e}")
         except Exception as e: logging.error(f"Error checking address {address} for gas: {e}")
+
+# --- PRICE TRACKING AND BALANCE UPDATE SYSTEM ---
+async def fetch_crypto_prices():
+    """Fetch current prices for all cryptocurrencies from CoinGecko API"""
+    global crypto_prices
+    
+    # Map method IDs to CoinGecko IDs
+    coin_ids = set()
+    for method_info in DEPOSIT_METHODS.values():
+        if method_info.get("coin_id"):
+            coin_ids.add(method_info["coin_id"])
+    
+    if not coin_ids:
+        logging.warning("No coin IDs configured for price fetching")
+        return
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            # Fetch prices from CoinGecko (free API, no key needed)
+            ids_str = ",".join(coin_ids)
+            url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids_str}&vs_currencies=usd"
+            response = await client.get(url, timeout=30.0)
+            
+            if response.status_code == 200:
+                price_data = response.json()
+                
+                # Update crypto_prices with new data
+                for coin_id, data in price_data.items():
+                    if "usd" in data:
+                        crypto_prices[coin_id] = data["usd"]
+                        logging.debug(f"Updated price for {coin_id}: ${data['usd']}")
+                
+                # Save to file for persistence
+                try:
+                    with open(CRYPTO_PRICES_FILE, "w") as f:
+                        json.dump({
+                            "prices": crypto_prices,
+                            "last_update": str(datetime.now(timezone.utc))
+                        }, f, indent=2)
+                except Exception as e:
+                    logging.error(f"Failed to save crypto prices to file: {e}")
+                
+                logging.info(f"Successfully fetched prices for {len(crypto_prices)} cryptocurrencies")
+            else:
+                logging.error(f"Failed to fetch prices from CoinGecko: HTTP {response.status_code}")
+                
+                # Fallback to Binance for specific coins
+                await fetch_prices_from_binance()
+                
+    except Exception as e:
+        logging.error(f"Error fetching crypto prices: {e}")
+        # Try Binance as fallback
+        await fetch_prices_from_binance()
+
+async def fetch_prices_from_binance():
+    """Fallback price fetching from Binance API"""
+    global crypto_prices
+    
+    binance_pairs = {
+        "bitcoin": "BTCUSDT",
+        "ethereum": "ETHUSDT",
+        "binancecoin": "BNBUSDT",
+        "litecoin": "LTCUSDT",
+        "dogecoin": "DOGEUSDT",
+        "solana": "SOLUSDT",
+        "tron": "TRXUSDT",
+        "the-open-network": "TONUSDT",
+        "matic-network": "MATICUSDT"
+    }
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            for coin_id, symbol in binance_pairs.items():
+                try:
+                    url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
+                    response = await client.get(url, timeout=10.0)
+                    if response.status_code == 200:
+                        price = float(response.json().get("price", 0))
+                        if price > 0:
+                            crypto_prices[coin_id] = price
+                            logging.debug(f"Fetched {coin_id} price from Binance: ${price}")
+                except Exception as e:
+                    logging.warning(f"Failed to fetch {symbol} from Binance: {e}")
+            
+            # USDT is always $1
+            crypto_prices["tether"] = 1.0
+            
+    except Exception as e:
+        logging.error(f"Error in Binance fallback: {e}")
+
+def load_crypto_prices():
+    """Load cached crypto prices from file"""
+    global crypto_prices
+    
+    if os.path.exists(CRYPTO_PRICES_FILE):
+        try:
+            with open(CRYPTO_PRICES_FILE, "r") as f:
+                data = json.load(f)
+                crypto_prices = data.get("prices", {})
+                last_update = data.get("last_update")
+                logging.info(f"Loaded {len(crypto_prices)} cached crypto prices (last updated: {last_update})")
+        except Exception as e:
+            logging.error(f"Failed to load crypto prices from file: {e}")
+    else:
+        logging.info("No cached crypto prices found, will fetch on first update")
+
+async def update_user_balances_based_on_prices(context: ContextTypes.DEFAULT_TYPE = None):
+    """
+    Update all user balances based on current crypto prices.
+    This runs every 5 minutes to reflect price changes without notifying users.
+    """
+    if not crypto_prices:
+        logging.warning("No crypto prices available, skipping balance update")
+        return
+    
+    updated_users = 0
+    total_adjustment = 0.0
+    
+    for user_id, deposits in list(crypto_user_deposits.items()):
+        if user_id not in user_wallets:
+            continue
+        
+        # Calculate new total value of user's crypto holdings
+        new_total_value = 0.0
+        
+        for deposit in deposits:
+            method = deposit["method"]
+            crypto_amount = deposit["crypto_amount"]
+            
+            if method not in DEPOSIT_METHODS:
+                continue
+            
+            coin_id = DEPOSIT_METHODS[method]["coin_id"]
+            current_price = crypto_prices.get(coin_id)
+            
+            if current_price is None:
+                # If we don't have the price, use the original USD value
+                new_total_value += deposit["usd_value_at_deposit"]
+                continue
+            
+            # Calculate current value of this deposit
+            current_value = crypto_amount * current_price
+            new_total_value += current_value
+        
+        # Calculate difference from current balance
+        current_balance = user_wallets.get(user_id, 0.0)
+        
+        # Only update if there's a difference (avoid unnecessary updates)
+        if abs(new_total_value - current_balance) > 0.01:  # $0.01 threshold
+            old_balance = current_balance
+            user_wallets[user_id] = new_total_value
+            adjustment = new_total_value - old_balance
+            total_adjustment += adjustment
+            updated_users += 1
+            
+            # Save user data
+            save_user_data(user_id)
+            
+            logging.debug(f"Updated balance for user {user_id}: ${old_balance:.2f} -> ${new_total_value:.2f} (change: ${adjustment:+.2f})")
+    
+    if updated_users > 0:
+        logging.info(f"Price update: Adjusted balances for {updated_users} users, total adjustment: ${total_adjustment:+.2f}")
+
+async def periodic_price_update_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Background job that runs every 5 minutes to:
+    1. Fetch latest cryptocurrency prices
+    2. Update all user balances based on current prices
+    """
+    logging.info("Running periodic price update job...")
+    
+    try:
+        # Step 1: Fetch latest prices
+        await fetch_crypto_prices()
+        
+        # Step 2: Update user balances based on new prices
+        await update_user_balances_based_on_prices(context)
+        
+    except Exception as e:
+        logging.error(f"Error in periodic price update job: {e}", exc_info=True)
 
 async def fund_gas_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != BOT_OWNER_ID: return
@@ -8746,6 +8946,10 @@ def main():
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, message_listener)) # For welcome message
 
     if app.job_queue:
+        # NEW: Periodic price update job - runs every 5 minutes (300 seconds)
+        app.job_queue.run_repeating(periodic_price_update_job, interval=PRICE_UPDATE_INTERVAL, first=30)
+        logging.info(f"Started periodic price update job (interval: {PRICE_UPDATE_INTERVAL}s)")
+        
         app.job_queue.run_repeating(check_addresses_for_gas, interval=3600, first=10)
         # Recover jobs on restart from saved state
         for user_id, session in user_deposit_sessions.items():
