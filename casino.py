@@ -6022,6 +6022,14 @@ async def check_addresses_for_gas(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e: logging.error(f"Error checking address {address} for gas: {e}")
 
 # --- PRICE TRACKING AND BALANCE UPDATE SYSTEM ---
+# This system implements automatic balance adjustments based on real-time cryptocurrency prices.
+# Key features:
+# 1. Tracks original crypto amounts for each deposit
+# 2. Fetches prices every 5 minutes from CoinGecko (with Binance fallback)
+# 3. Automatically recalculates user balances based on current prices
+# 4. Updates happen silently without notifying users
+# 5. All data persists across bot restarts
+
 async def fetch_crypto_prices():
     """Fetch current prices for all cryptocurrencies from CoinGecko API"""
     global crypto_prices
